@@ -3,6 +3,7 @@ import express from "express";
 import { connectDB } from "./config/db";
 import cors from "cors";
 import axios from "axios";
+import { IOrder, PaymentStatus, OrderStatus } from "./models/IOrder";
 
 const YOUR_DOMAIN = "http://localhost:3000";
 dotenv.config();
@@ -19,7 +20,6 @@ import customerRouter from "./routes/customers";
 import orderRouter from "./routes/orders";
 import orderItemRouter from "./routes/orderItems";
 import { IProduct } from "./models/IProduct";
-import { ICustomer } from "./models/ICustomer";
 app.use("/products", productRouter);
 app.use("/customers", customerRouter);
 app.use("/orders", orderRouter);
@@ -62,13 +62,14 @@ app.post("/stripe/create-checkout-session", async (req, res) => {
     ui_mode: "embedded",
     return_url: "http://localhost:5173/order-confirmation/{CHECKOUT_SESSION_ID}",
     client_reference_id: order_id,
+    expires_at: Math.floor(Date.now() / 1000) + 30 * 60, // 30 minutes
   });
   await axios.patch(
     `http://localhost:3000/orders/${order_id}`,
     {
       payment_id: session.id,
-      payment_status: "Unpaid",
-      order_status: "Pending",
+      payment_status: PaymentStatus.Unpaid,
+      order_status: OrderStatus.Pending,
     },
     {
       headers: {
@@ -84,19 +85,16 @@ app.post("/stripe/webhook", async (request, response) => {
   // console.log("event:", event);
 
   // Handle the event
+  const session = event.data.object;
+  const { id, client_reference_id } = event.data.object;
   switch (event.type) {
     case "checkout.session.completed":
-      const session = event.data.object;
-      const { id, client_reference_id } = event.data.object;
-      console.log("id", id);
-      console.log("client_reference_id", client_reference_id);
-
       await axios.patch(
         `http://localhost:3000/orders/${client_reference_id}`,
         {
           payment_id: id,
-          payment_status: "Paid",
-          order_status: "Recieved",
+          payment_status: PaymentStatus.Paid,
+          order_status: OrderStatus.Recieved,
         },
         {
           headers: {
@@ -114,9 +112,15 @@ app.post("/stripe/webhook", async (request, response) => {
         await axios.patch(`http://localhost:3000/products/${item.product_id}`, product);
         console.log(`${item.product_id} updated`);
       });
-
       break;
-
+    case "checkout.session.expired":
+      console.log("Payment canceled");
+      await axios.delete(`http://localhost:3000/orders/${client_reference_id}`, {
+        headers: {
+          "Content-Type": "application/json",
+        },
+      });
+      break;
     default:
   }
 
