@@ -1,8 +1,8 @@
-import { Checkout } from "./../../../09-lecture/03-cart-with-localstorage/src/pages/Checkout";
 import dotenv from "dotenv";
 import express from "express";
 import { connectDB } from "./config/db";
 import cors from "cors";
+import axios from "axios";
 
 const YOUR_DOMAIN = "http://localhost:3000";
 dotenv.config();
@@ -19,6 +19,7 @@ import customerRouter from "./routes/customers";
 import orderRouter from "./routes/orders";
 import orderItemRouter from "./routes/orderItems";
 import { IProduct } from "./models/IProduct";
+import { ICustomer } from "./models/ICustomer";
 app.use("/products", productRouter);
 app.use("/customers", customerRouter);
 app.use("/orders", orderRouter);
@@ -26,45 +27,100 @@ app.use("/order-items", orderItemRouter);
 
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 
-app.post("/stripe/create-checkout-session", async (req, res) => {
-  interface ICartItem {
-    product: IProduct;
-    quantity: number;
-  }
-  interface ILineItem {
-    price_data: {
-      currency: string;
-      product_data: {
-        name: string;
-        images?: string[];
-        description: string;
-      };
-      unit_amount: number;
+interface ILineItem {
+  price_data: {
+    currency: string;
+    product_data: {
+      name: string;
+      images?: string[];
+      description: string;
     };
-    quantity: number;
-  }
+    unit_amount: number;
+  };
+  quantity: number;
+}
+interface IPayload {
+  line_items: ILineItem[];
+  order_id: number;
+  metadata: metadata[];
+}
+interface metadata {
+  product_id: number;
+  quantity: number;
+}
 
-  const cart: ICartItem[] = req.body.cart;
+app.post("/stripe/create-checkout-session", async (req, res) => {
+  const { line_items, order_id, metadata }: IPayload = req.body.payload;
+  const metadataString = JSON.stringify(metadata);
+
   const session = await stripe.checkout.sessions.create({
-    line_items: cart.map((item: ICartItem): ILineItem => {
-      return {
-        price_data: {
-          currency: "sek",
-          product_data: {
-            name: item.product.name,
-            images: [item.product.image],
-            description: item.product.description,
-          },
-          unit_amount: item.product.price * 100,
-        },
-        quantity: item.quantity,
-      };
-    }),
+    line_items: line_items,
+    metadata: {
+      items: metadataString,
+    },
     mode: "payment",
     ui_mode: "embedded",
-    return_url: "http://localhost:5173/order-confirmation?session_id={CHECKOUT_SESSION_ID}",
+    return_url: "http://localhost:5173/order-confirmation/{CHECKOUT_SESSION_ID}",
+    client_reference_id: order_id,
   });
-  res.send({ clientSecret: session.client_secret });
+  await axios.patch(
+    `http://localhost:3000/orders/${order_id}`,
+    {
+      payment_id: session.id,
+      payment_status: "Unpaid",
+      order_status: "Pending",
+    },
+    {
+      headers: {
+        "Content-Type": "application/json",
+      },
+    }
+  );
+  res.send({ clientSecret: session.client_secret }); //Skall denna ändras till session.id?
+});
+
+app.post("/stripe/webhook", async (request, response) => {
+  const event = request.body;
+  // console.log("event:", event);
+
+  // Handle the event
+  switch (event.type) {
+    case "checkout.session.completed":
+      const session = event.data.object;
+      const { id, client_reference_id } = event.data.object;
+      console.log("id", id);
+      console.log("client_reference_id", client_reference_id);
+
+      await axios.patch(
+        `http://localhost:3000/orders/${client_reference_id}`,
+        {
+          payment_id: id,
+          payment_status: "Paid",
+          order_status: "Recieved",
+        },
+        {
+          headers: {
+            "Content-Type": "application/json",
+          },
+        }
+      );
+
+      const metadata = JSON.parse(session.metadata.items);
+      metadata.forEach(async (item: metadata) => {
+        const response = await axios.get(`http://localhost:3000/products/${item.product_id}`);
+        const product: IProduct = response.data;
+        product.stock -= item.quantity;
+
+        await axios.patch(`http://localhost:3000/products/${item.product_id}`, product);
+        console.log(`${item.product_id} updated`);
+      });
+
+      break;
+
+    default:
+  }
+
+  response.json({ received: true });
 });
 // Attempt to connect to the database
 connectDB();
